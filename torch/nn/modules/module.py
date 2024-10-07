@@ -3,6 +3,7 @@
 '''
 
 # mypy: allow-untyped-defs
+# 用于静态类型检查器 mypy 的指令（或标记），目的是告知 mypy 允许没有类型注解的函数定义，而不触发类型检查警告或错误。
 from collections import OrderedDict, namedtuple
 import itertools
 import warnings
@@ -11,65 +12,110 @@ import weakref
 
 import torch
 from torch._prims_common import DeviceLikeType
-from ..parameter import Parameter
+from ..parameter import Parameter                       # 从上级目录导入Parameter这个对torch.Tensor的高级封装类
 import torch.utils.hooks as hooks
 
 from torch import Tensor, device, dtype
-from typing import Union, Tuple, Any, Callable, Iterator, Set, Optional, overload, TypeVar, Mapping, Dict, List
+from typing import Union, Tuple, Any, Callable, Iterator, Set, Optional, overload, TypeVar, Mapping, Dict, List             # 导入了多种类型注解
 from typing_extensions import Self
 from ...utils.hooks import RemovableHandle
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
+# 定义了模块公开的API列表，当使用from module import *这样的导入语句时，Python解释器将根据__all__列表来决定哪些名字是可见的，
+# 即哪些名字将被导入到当前命名空间中。如果模块中没有定义__all__，那么所有的公共名字（不以下划线开头的名字）都将被导入。
 __all__ = ['register_module_forward_pre_hook', 'register_module_forward_hook',
            'register_module_full_backward_pre_hook', 'register_module_backward_hook',
            'register_module_full_backward_hook', 'register_module_buffer_registration_hook',
            'register_module_module_registration_hook', 'register_module_parameter_registration_hook', 'Module']
 
+# 定义了一个类型别名，表示梯度可以是一个张量元组或单个张量（Union表示一个值可以是多种类型中的一种）。
 _grad_t = Union[Tuple[Tensor, ...], Tensor]
-# See https://mypy.readthedocs.io/en/latest/generics.html#generic-methods-and-generic-self for the use
-# of `T` to annotate `self`. Many methods of `Module` return `self` and we want those return values to be
-# the type of the subclass, not the looser type of `Module`.
+
+
+"""
+请参阅 https://mypy.readthedocs.io/en/latest/generics.html#generic-methods-and-generic-self 
+用于使用“T”注释“self”。“Module”的许多方法返回“self”，我们希望这些返回值是子类的类型，而不是更松散的“Module”类型。
+使用TypeVar定义了一个类型变量T，它被约束为Module的子类。这在泛型方法和返回类型中很有用，确保返回的是子类类型而不是更宽泛的Module类型
+
+bound='Module'指定了类型变量T的上界（bound）。这意味着T可以是Module类型或者其任何子类的实例。在类型检查期间，T将被视为至少和Module一样具体的类型。
+通俗来说：T的本质还是一个类型注释，只不过和其他确定的、专一的类型注释（int, float）不一样，T指向所有Module及其子类。
+是多态的鲜活例子，允许一个函数能处理多种类型的数据
+"""
 T = TypeVar('T', bound='Module')
 
+"""
+本质是一个接收有意外的键的输出器，_IncompatibleKeys实例被用来存储和输出在某个过程中发现的不兼容的键（包括缺失的键和意外的键。）
+如果所有的键都匹配，print(incompatible_keys)将输出<All keys matched successfully>。如果存在不匹配的键，它将输出这些键的列表。
 
+重写了__repr__方法，以提供自定义的字符串表示。
+"""
 class _IncompatibleKeys(namedtuple('IncompatibleKeys', ['missing_keys', 'unexpected_keys'])):
+    """
+    namedtuple是collections模块中的一个工厂函数，用于创建一个继承自tuple的不可变数据结构，它拥有指定的字段名。这个数据结构通常称作命名元组（named tuple）。
+    第一个参数'IncompatibleKeys'是命名元组的名称，它将作为类的名称。
+    第二个参数['missing_keys', 'unexpected_keys']是一个列表，包含了命名元组中字段的名称。这些字段是命名元组的组成部分，可以像属性一样访问。
+    """
     def __repr__(self):
+        """
+        __repr__ 是一个特殊方法，用于返回对象的官方字符串表示，通常用于调试。在这个类中，
+        如果 missing_keys 和 unexpected_keys 列表都为空，表示所有的键都匹配成功，__repr__ 返回一个友好的消息 <All keys matched successfully>。
+        如果有不匹配的键，__repr__ 调用父类（即 namedtuple 创建的元组子类）的 __repr__ 方法来返回默认的字符串表示。
+        """
         if not self.missing_keys and not self.unexpected_keys:
             return '<All keys matched successfully>'
         return super().__repr__()
-
+    # __str__ 是另一个特殊方法，用于返回对象的非正式字符串表示，通常用于用户展示。
     __str__ = __repr__
 
-
+# 用于给多行字符串的每一行添加指定数量空格缩进（除了第一行）的工具函数
 def _addindent(s_, numSpaces):
-    s = s_.split('\n')
-    # don't do anything for single-line stuff
+    """
+    s_：要添加缩进的原始字符串。
+    numSpaces：要添加的空格数量。
+    """
+    s = s_.split('\n')          # 将输入的字符串s_按行分割成列表，每行作为列表的一个元素。
+    # 如果原始字符串只有一行（即没有换行符），则不需要添加缩进，直接返回原始字符串。
     if len(s) == 1:
         return s_
-    first = s.pop(0)
-    s = [(numSpaces * ' ') + line for line in s]
-    s = '\n'.join(s)
-    s = first + '\n' + s
+    first = s.pop(0)            # 取出第一行，并从列表中移除。这样，first变量现在包含原始字符串的第一行，而列表s包含剩余的所有行。
+    s = [(numSpaces * ' ') + line for line in s]        #  使用列表推导式为列表s中的每一行添加指定数量的空格。numSpaces * ' ' 创建一个由numSpaces个空格组成的字符串，然后将其与每一行连接。
+    s = '\n'.join(s)            # 将添加了空格的行列表重新连接成一个多行字符串，行与行之间用换行符\n分隔。
+    s = first + '\n' + s        # 将未添加空格的第一行first与添加了空格的剩余行s连接起来，保持原有的第一行不缩进，而从第二行开始添加缩进。
     return s
 
+
 r"""This tracks hooks common to all modules that are executed immediately before
-.registering the buffer/module/parameter"""
+.registering the buffer/module/parameter
+用于描述下面的代码。它说明了这些钩子是在注册 buffer/module/parameter **之前立即执行**的
+涉及到模块（Module）的钩子（hook）机制。钩子是函数，可以在模块的生命周期中的特定点触发或调用。
+下面三行：全局钩子字典，buffer/module/parameter三种类型的数据的注册钩子，都是有序字典（OrderedDict），使用整数作为键，可调用对象（Callable）作为值。
+"""
 _global_buffer_registration_hooks: Dict[int, Callable] = OrderedDict()
 _global_module_registration_hooks: Dict[int, Callable] = OrderedDict()
 _global_parameter_registration_hooks: Dict[int, Callable] = OrderedDict()
 
+# 这个类封装Wrap了钩子函数，并提供了额外的功能，比如与特定模块的关联。
 class _WrappedHook:
+    """主要作用是提供一个钩子包装器，它可以存储关于钩子的附加信息（如是否与特定模块关联），并确保钩子在模块销毁后不会被错误地调用。
+    这是PyTorch模块系统中钩子机制的一部分，允许开发者在模块的生命周期中插入自定义逻辑。"""
     def __init__(self, hook: Callable, module: Optional["Module"] = None):
+        """
+        构造函数接受一个钩子函数hook和一个可选的模块module。
+        """
         self.hook: Callable = hook
-        functools.update_wrapper(self, hook)
+        functools.update_wrapper(self, hook)            # 更新_WrappedHook实例的__dict__属性和__wrapped__属性，以保留原始钩子函数的元数据。
 
-        self.with_module: bool = False
+        self.with_module: bool = False                  # 指示钩子是否与特定模块关联。如果module为none则不关联，否则关联
 
-        if module is not None:
+        if module is not None:                          # 如果提供了module参数，使用weakref.ref创建钩子函数对模块的弱引用，这样就不会阻止模块被垃圾回收。
             self.module: weakref.ReferenceType[Module] = weakref.ref(module)
             self.with_module = True
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """
+        这使得_WrappedHook实例可以像函数一样被调用。
+        如果钩子与模块关联，并且Module存在，则调用钩子函数，并将模块作为第一个参数传递。
+        """
         if self.with_module:
             module = self.module()
             if module is None:
@@ -78,6 +124,9 @@ class _WrappedHook:
         return self.hook(*args, **kwargs)
 
     def __getstate__(self) -> Dict:
+        """
+        对象的序列化方法，用于在pickle过程中获取对象的状态。它返回一个包含钩子和相关状态的字典。
+        """
         result = {"hook": self.hook, "with_module": self.with_module}
         if self.with_module:
             result["module"] = self.module()
@@ -85,50 +134,64 @@ class _WrappedHook:
         return result
 
     def __setstate__(self, state: Dict):
+        """
+        这是对象的反序列化方法，用于在unpickle过程中设置对象的状态。它根据传入的状态字典设置钩子和相关状态。
+        """
         self.hook = state["hook"]
         self.with_module = state["with_module"]
 
         if self.with_module:
             if state["module"] is None:
+                '如果尝试调用已销毁模块的钩子，或尝试恢复已销毁模块的钩子，将引发RuntimeError。'
                 raise RuntimeError("You are trying to revive the hook of a dead Module!")
             self.module = weakref.ref(state["module"])
 
 
 r"""This tracks hooks common to all modules that are executed before/after
 calling forward and backward. This is global state used for debugging/profiling
-purposes"""
-_global_backward_pre_hooks: Dict[int, Callable] = OrderedDict()
-_global_backward_hooks: Dict[int, Callable] = OrderedDict()
-_global_is_full_backward_hook: Optional[bool] = None
-_global_forward_pre_hooks: Dict[int, Callable] = OrderedDict()
-_global_forward_hooks: Dict[int, Callable] = OrderedDict()
-_global_forward_hooks_always_called: Dict[int, bool] = OrderedDict()
+purposes这跟踪在向前和向后调用之前/之后执行的所有模块的通用钩子。这是用于调试/分析目的的全局状态
+这些钩子和状态管理机制允许开发者在模块的执行流程中插入自定义逻辑，例如：
+（1）在计算图的构建或执行前后添加自定义操作。
+（2）在反向传播时修改梯度。
+（3）在前向传播前后执行特定的初始化或清理操作。"""
+_global_backward_pre_hooks: Dict[int, Callable] = OrderedDict()          # 存储在后向传播开始之前执行的钩子。
+_global_backward_hooks: Dict[int, Callable] = OrderedDict()              # 存储在后向传播过程中执行的钩子。
+_global_is_full_backward_hook: Optional[bool] = None                     # 一个布尔值，指示是否注册了全后向钩子。全后向钩子会在每次反向传播时被调用。
 
-_EXTRA_STATE_KEY_SUFFIX = '_extra_state'
+_global_forward_pre_hooks: Dict[int, Callable] = OrderedDict()           # 存储在前向传播开始之前执行的钩子。
+_global_forward_hooks: Dict[int, Callable] = OrderedDict()               # 存储在前向传播过程中执行的钩子。
+_global_forward_hooks_always_called: Dict[int, bool] = OrderedDict()     # 存储一个布尔值，指示是否应该在每次前向传播时调用特定的前向钩子。
+
+_EXTRA_STATE_KEY_SUFFIX = '_extra_state'        # 定义了一个额外状态键的后缀字符串。这通常用于模块的额外状态，例如在序列化和反序列化过程中存储和检索模块的额外信息。
 
 
+
+# 下面八个钩子注册函数，都是在上述_global_buffer_registration_hooks等有序字典中注册钩子
+# 并将其放入hooks.RemovableHandle中返回
 def register_module_buffer_registration_hook(hook: Callable[..., None]) -> RemovableHandle:
-    r"""Register a buffer registration hook common to all modules.
+    r"""注册所有模块通用的buffer注册hook.它接受一个参数 hook 和返回一个 RemovableHandle 对象
 
     .. warning ::
 
-        This adds global state to the `nn.Module` module
+        这为nn.Module添加了全局状态。
 
-    The hook will be called every time :func:`register_buffer` is invoked.
-    It should have the following signature::
-
+    每次调用：`register_buffer`时都会调用钩子。它应该有以下签名signature(函数名以及其参数的集合)：
         hook(module, name, buffer) -> None or new buffer
 
-    The hook can modify the input or return a single modified value in the hook.
+    钩子可以修改输入，or return a single modified value in the hook.
 
     Returns:
         :class:`torch.utils.hooks.RemovableHandle`:
             a handle that can be used to remove the added hook by calling
             ``handle.remove()``
     """
+
+    # 创建一个 RemovableHandle 对象，它与前面定义的 _global_buffer_registration_hooks 字典相关联。
+    # RemovableHandle 类似于一个唯一标识符，可以用于后续移除或管理注册的钩子。
     handle = hooks.RemovableHandle(_global_buffer_registration_hooks)
+    # 将传入的 hook 函数注册到 _global_buffer_registration_hooks 有序字典中。钩子将使用 handle.id 作为键，确保每个钩子都有一个唯一的标识。
     _global_buffer_registration_hooks[handle.id] = hook
-    return handle
+    return handle  # 返回 RemovableHandle 对象。这个对象可以被用来引用或移除注册的钩子
 
 
 def register_module_module_registration_hook(hook: Callable[..., None]) -> RemovableHandle:
@@ -339,30 +402,40 @@ def register_module_full_backward_hook(
     return handle
 
 
+# Module需要重写forward，如果没有，指出模块缺少必需的 forward 函数。
+# 用于替代 PyTorch 模块中的 forward 函数。通过将forward定义为值而不是函数，让mypy不将反向规则应用于输入。
 # Trick mypy into not applying contravariance rules to inputs by defining
-# forward as a value, rather than a function.  See also
-# https://github.com/python/mypy/issues/8795
+# forward as a value, rather than a function.
+# 另请参见https://github.com/python/mypy/issues/8795
 def _forward_unimplemented(self, *input: Any) -> None:
-    r"""Define the computation performed at every call.
-
-    Should be overridden by all subclasses.
+    r"""定义每次调用时执行的计算。应被所有子类覆盖。
 
     .. note::
         Although the recipe for forward pass needs to be defined within
         this function, one should call the :class:`Module` instance afterwards
         instead of this since the former takes care of running the
         registered hooks while the latter silently ignores them.
+        如果 _forward_unimplemented 被调用，它将引发一个 NotImplementedError 异常，指出模块缺少必需的 forward 函数。
     """
     raise NotImplementedError(f'Module [{type(self).__name__}] is missing the required "forward" function')
 
-
+"""
+Module类作为所有神经网络模块的基类，内核有2：
+（1）本身是功能模块，如Embedding，需要梯度的_parameters或者不需要梯度的buffer，
+（2）本身是结构模块，如Model类，则保存相应的子模块的结构信息、state_dict
+此外，定义了与前后向传播与状态字典相关的有序字典，并设置了以下功能：
+（1）必须在子类中重写的forward函数
+（2）对Module结构进行递归操作的apply方法
+（3）模块参数移动方法to以及三个重载入口
+（4）被调用call时采取的5种钩子和forward逻辑：__call__ : Callable[..., Any] = _wrapped_call_impl
+（5）获取、修改属性
+（6）state_dict相关方法
+（7）param、module等子模块获取、tran/eval属性设置、数据并行、编译
+"""
 class Module:
-    r"""Base class for all neural network modules.
-
-    Your models should also subclass this class.
-
-    Modules can also contain other Modules, allowing to nest them in
-    a tree structure. You can assign the submodules as regular attributes::
+    r"""所有神经网络模块的基类。
+    你的模型也应该子类化这个类。
+    模块还可以包含其他模块，允许将它们嵌套在树结构中。您可以将子模块指定为常规属性，例如：
 
         import torch.nn as nn
         import torch.nn.functional as F
@@ -376,65 +449,60 @@ class Module:
             def forward(self, x):
                 x = F.relu(self.conv1(x))
                 return F.relu(self.conv2(x))
-
-    Submodules assigned in this way will be registered, and will have their
-    parameters converted too when you call :meth:`to`, etc.
-
-    .. note::
-        As per the example above, an ``__init__()`` call to the parent class
-        must be made before assignment on the child.
-
-    :ivar training: Boolean represents whether this module is in training or
-                    evaluation mode.
-    :vartype training: bool
+                
+    以这种方式分配的子模块将被注册，并且当您调用：to方法时，module的的parameters也将被转换。
+    ..注：
+        根据上面的例子，在对子类进行赋值之前，必须对父类进行`__init__（）`调用。
+    ：ivar training：布尔值，表示此模块是处于训练模式还是评估模式。
     """
+    # 类属性两个
+    dump_patches: bool = False          # 一个类属性，用于控制是否转储补丁（可能是为了调试目的）。
+    _version: int = 1                   # module版本的类属性。
+    r"""
+    这允许更好地支持`load_state_dict`方法的向后兼容（BC）。在`load_state_dict`方法中，
+    版本号version number将保存在返回的状态字典的属性`_metadata`中，因此会被缓存。
+    `_metada`是一个字典，其键遵循状态字典的命名约定。有关如何在加载中使用此信息，请参阅`_load_from_state_dict `。”。
 
-    dump_patches: bool = False
+    如果在module中添加/删除了新的parameters/buffers，则应删除此数字，并且模块的`_load_from_state_dict`方法可以比较版本号，如果状态字典来自更改之前，则可以进行适当的更改。"""
 
-    _version: int = 1
-    r"""This allows better BC support for :meth:`load_state_dict`. In
-    :meth:`state_dict`, the version number will be saved as in the attribute
-    `_metadata` of the returned state dict, and thus pickled. `_metadata` is a
-    dictionary with keys that follow the naming convention of state dict. See
-    ``_load_from_state_dict`` on how to use this information in loading.
+    # 实例属性
+    training: bool                                  # 指示模块是否处于训练模式（True）或评估模式（False）。
+    _parameters: Dict[str, Optional[Parameter]]     # 一个字典，存储模块的参数，键是参数名，值是Parameter对象或None。
+    _buffers: Dict[str, Optional[Tensor]]           # 一个字典，存储模块的缓冲区，键是缓冲区名，值是Tensor对象或None。
+    _non_persistent_buffers_set: Set[str]           # 一个集合，包含非持久性缓冲区的名称，这些缓冲区在每次前向传播后不会被保存。
 
-    If new parameters/buffers are added/removed from a module, this number shall
-    be bumped, and the module's `_load_from_state_dict` method can compare the
-    version number and do appropriate changes if the state dict is from before
-    the change."""
+    # 前后向传播钩子
+    _backward_pre_hooks: Dict[int, Callable]        # 字典：在反向传播开始前调用的钩子函数。
+    _backward_hooks: Dict[int, Callable]            # 字典：在反向传播过程中调用的钩子函数。
+    _is_full_backward_hook: Optional[bool]          # 布尔值，指示是否注册了全反向钩子。
+    _forward_hooks: Dict[int, Callable]             # 字典：在前向传播过程中调用的钩子函数。 
+    _forward_hooks_with_kwargs: Dict[int, bool]     # 字典：标记相应的_forward_hooks是否接受kwargs。由于JIT不支持Set[int]，因此将此dict用作一个集合，其中此dict中表示的所有钩子都接受kwargs。
+    
+    _forward_hooks_always_called: Dict[int, bool]   # 字典：即使引发异常，也终调用的前向钩子
+    
+    _forward_pre_hooks: Dict[int, Callable]         # 字典：在前向传播开始前调用的钩子函数。
+    _forward_pre_hooks_with_kwargs: Dict[int, bool] # 标记_forward_pre_hooks中相应的钩子是否接受**kwargs参数。
 
-    training: bool
-    _parameters: Dict[str, Optional[Parameter]]
-    _buffers: Dict[str, Optional[Tensor]]
-    _non_persistent_buffers_set: Set[str]
-    _backward_pre_hooks: Dict[int, Callable]
-    _backward_hooks: Dict[int, Callable]
-    _is_full_backward_hook: Optional[bool]
-    _forward_hooks: Dict[int, Callable]
-    # Marks whether the corresponding _forward_hooks accept kwargs or not.
-    # As JIT does not support Set[int], this dict is used as a set, where all
-    # hooks represented in this dict accept kwargs.
-    _forward_hooks_with_kwargs: Dict[int, bool]
-    # forward hooks that should always be called even if an exception is raised
-    _forward_hooks_always_called: Dict[int, bool]
-    _forward_pre_hooks: Dict[int, Callable]
-    # Marks whether the corresponding _forward_hooks accept kwargs or not.
-    # As JIT does not support Set[int], this dict is used as a set, where all
-    # hooks represented in this dict accept kwargs.
-    _forward_pre_hooks_with_kwargs: Dict[int, bool]
-    _state_dict_hooks: Dict[int, Callable]
-    _load_state_dict_pre_hooks: Dict[int, Callable]
-    _state_dict_pre_hooks: Dict[int, Callable]
-    _load_state_dict_post_hooks: Dict[int, Callable]
-    _modules: Dict[str, Optional['Module']]
-    call_super_init: bool = False
-    _compiled_call_impl : Optional[Callable] = None
+    # 状态字典钩子
+    _state_dict_hooks: Dict[int, Callable]          # 在模块状态字典（即参数和缓冲区）序列化之前调用的钩子函数。
+    _load_state_dict_pre_hooks: Dict[int, Callable] # 在模块加载状态字典之前调用的钩子函数。
+    _state_dict_pre_hooks: Dict[int, Callable]      # 在模块状态字典序列化之前调用的钩子函数。
+    _load_state_dict_post_hooks: Dict[int, Callable]# 在模块加载状态字典之后调用的钩子函数。
+
+    # 子模块
+    _modules: Dict[str, Optional['Module']]         # 一个字典，存储模块的子模块，键是子模块名，值是Module对象。
+    call_super_init: bool = False                   # 类属性，用于控制是否在子类的构造函数中调用父类的构造函数。在某些情况下，如果子类需要自定义初始化逻辑，可能会设置这个属性为False，以避免调用父类的__init__方法。
+    _compiled_call_impl : Optional[Callable] = None # 用于存储编译后的调用实现。在PyTorch中，某些模块的操作可以通过TorchScript编译来提高性能。如果模块的方法被编译，_compiled_call_impl将是一个可调用对象，表示编译后的实现。如果未编译或不需要编译，这个属性将是None。
 
     def __init__(self, *args, **kwargs) -> None:
-        """Initialize internal Module state, shared by both nn.Module and ScriptModule."""
-        torch._C._log_api_usage_once("python.nn_module")
+        """初始化内部模块状态，由nn.Module 和 ScriptModule共享
+        接受任意数量的位置参数 *args 和关键字参数 **kwargs，并返回 None（即不返回任何值）。"""
 
-        # Backward compatibility: no args used to be allowed when call_super_init=False
+        # 记录了 nn.Module 被使用的情况，这通常用于跟踪API的使用情况，以便进行性能监控或功能改进。
+        torch._C._log_api_usage_once("python.nn_module")
+        
+        # 向后兼容性：call_super_init=False、且构造函数接收到了关键字参数 kwargs 或位置参数 args，将分别抛出 TypeError。
+        # 这确保了当子类没有定义自己的 __init__ 方法或不希望处理额外的参数时，不会意外接收到参数。
         if self.call_super_init is False and bool(kwargs):
             raise TypeError(f"{type(self).__name__}.__init__() got an unexpected keyword argument '{next(iter(kwargs))}'"
                             "")
@@ -444,10 +512,12 @@ class Module:
                             " given")
 
         """
-        Calls super().__setattr__('a', a) instead of the typical self.a = a
-        to avoid Module.__setattr__ overhead. Module's __setattr__ has special
-        handling for parameters, submodules, and buffers but simply calls into
-        super().__setattr__ for all other attributes.
+        调用super().__setattr__('a', a)代替典型的self.a=a以避免Module.__setattr__的开销。
+        Module的__setattr__对arameters, submodules, and buffers有特殊的处理，
+        但对所有其他属性只是调用super（）__setattr_
+
+        下面使用 super().__setattr__ 来初始化 Module 类的多个属性如training：布尔值，表示模块是否处于训练模式。
+            各种以 _ 开头的属性，如 _parameters、_buffers 等，它们是有序字典（OrderedDict）或集合（set），用于存储模块的参数、缓冲区、钩子等。
         """
         super().__setattr__('training', True)
         super().__setattr__('_parameters', OrderedDict())
@@ -468,42 +538,36 @@ class Module:
         super().__setattr__('_modules', OrderedDict())
 
         if self.call_super_init:
+            "如果需要父类初始化，才初始化。这是一种安全的做法，确保如果父类有任何初始化逻辑，子类也会执行。"
             super().__init__(*args, **kwargs)
 
+    # 提供了一个默认实现 _forward_unimplemented。这是一个未实现的前向传播方法，如果子类没有重写 forward 方法，将引发 NotImplementedError 异常。
     forward: Callable[..., Any] = _forward_unimplemented
 
+    # 在module注册一个buffer
     def register_buffer(self, name: str, tensor: Optional[Tensor], persistent: bool = True) -> None:
-        r"""Add a buffer to the module.
+        r""".
+        这通常用于注册不应被视为模型参数parameter的缓冲区buffer。
+        例如，BatchNorm的`running_man`不是参数，而是模块状态的一部分。
+        默认情况下，缓冲区是持久的，将与参数一起保存。
+        可以通过将：attr:“persistent”设置为“False”来更改此行为。
+        持久缓冲区和非持久缓冲区之间的唯一区别是，后者不会成为此模块的：attr:`state_dict`的一部分。
 
-        This is typically used to register a buffer that should not to be
-        considered a model parameter. For example, BatchNorm's ``running_mean``
-        is not a parameter, but is part of the module's state. Buffers, by
-        default, are persistent and will be saved alongside parameters. This
-        behavior can be changed by setting :attr:`persistent` to ``False``. The
-        only difference between a persistent buffer and a non-persistent buffer
-        is that the latter will not be a part of this module's
-        :attr:`state_dict`.
-
-        Buffers can be accessed as attributes using given names.
+        缓冲区可以使用给定的名称作为属性进行访问，例如model.aaa_buffer
 
         Args:
-            name (str): name of the buffer. The buffer can be accessed
-                from this module using the given name
-            tensor (Tensor or None): buffer to be registered. If ``None``, then operations
-                that run on buffers, such as :attr:`cuda`, are ignored. If ``None``,
-                the buffer is **not** included in the module's :attr:`state_dict`.
-            persistent (bool): whether the buffer is part of this module's
-                :attr:`state_dict`.
-
+            name (str): 缓冲区的名称。可以使用给定的名称从该模块访问缓冲区
+            tensor (Tensor or None): 要注册的buffer的张量主体。如果为“None”，则在buffer上的一些操作如指定设备的'cuda'属性将被忽略；如果为“None”，则buffer不被包含在模块的state_dict属性中
+            persistent (bool): 缓冲区是否是此模块的一部分：attr:`state_dict`
         Example::
-
-            >>> # xdoctest: +SKIP("undefined vars")
             >>> self.register_buffer('running_mean', torch.zeros(num_features))
-
         """
+
+        # 检查：ScriptModule不支持非持久性缓冲区
         if persistent is False and isinstance(self, torch.jit.ScriptModule):
             raise RuntimeError("ScriptModule does not support non-persistent buffers")
 
+        # 检查_buffers属性是否在__dict__中，否则报错无法在模块之前分配缓冲区__init__（）调用
         if '_buffers' not in self.__dict__:
             raise AttributeError(
                 "cannot assign buffer before Module.__init__() call")
@@ -520,16 +584,20 @@ class Module:
                             "(torch Tensor or None required)"
                             )
         else:
+            "上述检查都没问题，则调用_global_buffer_registration_hooks字典中的hook函数 *递归* 处理传入的tensor"
             for hook in _global_buffer_registration_hooks.values():
                 output = hook(self, name, tensor)
                 if output is not None:
                     tensor = output
             self._buffers[name] = tensor
             if persistent:
+                "如果是持久的，则从非持久列表中删除"
                 self._non_persistent_buffers_set.discard(name)
             else:
+                "否则加入"
                 self._non_persistent_buffers_set.add(name)
 
+    # 在module注册一个parameter，类上，递归用钩子函数操作完毕后加入Module的_parameters字典。
     def register_parameter(self, name: str, param: Optional[Parameter]) -> None:
         r"""Add a parameter to the module.
 
@@ -575,11 +643,10 @@ class Module:
                     param = output
             self._parameters[name] = param
 
+    # 当Module实例作为结构上的父模块时：将子模块添加到当前模块。可以使用给定的名称作为属性访问该模块。主要对子模块的命名进行规范，
+    # 然后递归调用_global_module_registration_hooks中的钩子，最后加入Module的_modules字典
     def add_module(self, name: str, module: Optional['Module']) -> None:
-        r"""Add a child module to the current module.
-
-        The module can be accessed as an attribute using the given name.
-
+        r"""
         Args:
             name (str): name of the child module. The child module can be
                 accessed from this module using the given name
@@ -601,14 +668,14 @@ class Module:
                 module = output
         self._modules[name] = module
 
+    # 与add_module一样
     def register_module(self, name: str, module: Optional['Module']) -> None:
         r"""Alias for :func:`add_module`."""
         self.add_module(name, module)
 
+    # 根据子模块名检查是否存在该子模块，如果存在“target”给出的子模块，则返回该子模块，否则抛出错误。
     def get_submodule(self, target: str) -> "Module":
-        """Return the submodule given by ``target`` if it exists, otherwise throw an error.
-
-        For example, let's say you have an ``nn.Module`` ``A`` that
+        """For example, let's say you have an ``nn.Module`` ``A`` that
         looks like this:
 
         .. code-block:: text
@@ -671,6 +738,7 @@ class Module:
 
         return mod
 
+    # 同上，检查模型参数
     def get_parameter(self, target: str) -> "Parameter":
         """Return the parameter given by ``target`` if it exists, otherwise throw an error.
 
@@ -707,6 +775,7 @@ class Module:
 
         return param
 
+    # 同上
     def get_buffer(self, target: str) -> "Tensor":
         """Return the buffer given by ``target`` if it exists, otherwise throw an error.
 
@@ -742,6 +811,7 @@ class Module:
 
         return buffer
 
+    # 返回任何额外的状态以包含在模块的state_dict中。不可用
     def get_extra_state(self) -> Any:
         """Return any extra state to include in the module's state_dict.
 
@@ -762,6 +832,7 @@ class Module:
             "Please file an issue at https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml "
             "to report this bug.")
 
+    # 同上，不可用
     def set_extra_state(self, state: Any) -> None:
         """Set extra state contained in the loaded `state_dict`.
 
@@ -778,21 +849,30 @@ class Module:
             "Please file an issue at https://github.com/pytorch/pytorch/issues/new?template=bug-report.yml "
             "to report this bug.")
 
+    # 提供了一种灵活的方式来对模块张量执行原地操作
     def _apply(self, fn, recurse=True):
+        """
+        在 PyTorch 的 Module 类中是一个受保护的方法，用于对模块的所有参数和缓冲区应用给定的函数 fn。
+        它通常用于对模块的张量执行原地操作，比如标准化或数据类型转换。以下是该方法的详细解释：
+        接受两个参数：fn，要应用的函数；recurse，一个布尔标志，决定是否递归地对所有子模块应用该函数。
+        
+        如果 recurse 为 True，则使用 self.children() 遍历所有子模块，并对每个子模块使用 module._apply(fn) 应用函数。
+        """
         if recurse:
-            for module in self.children():
+            for module in self.children():      
                 module._apply(fn)
 
         def compute_should_use_set_data(tensor, tensor_applied):
+            """
+            compute_should_use_set_data 是一个内部函数，根据兼容性和未来行为标志来决定是否对张量使用 .data 设置器。
+            方法检查未来行为标志，如torch.__future__.get_overwrite_module_params_on_conversion() 和
+              torch.__future__.get_swap_module_params_on_conversion()，这些标志控制参数如何更新
+            """
             if torch._has_compatible_shallow_copy_type(tensor, tensor_applied):
-                # If the new tensor has compatible tensor type as the existing tensor,
-                # the current behavior is to change the tensor in-place using `.data =`,
-                # and the future behavior is to overwrite the existing tensor. However,
-                # changing the current behavior is a BC-breaking change, and we want it
-                # to happen in future releases. So for now we introduce the
-                # `torch.__future__.get_overwrite_module_params_on_conversion()`
-                # global flag to let the user control whether they want the future
-                # behavior of overwriting the existing tensor or not.
+                # 如果新张量与现有张量具有兼容的张量类型，则当前行为是使用`.data=`就地更改张量，
+                # 未来行为是覆盖现有张量。然而，改变当前的行为是一种破坏BC的更改，我们希望它在未来的版本中发生。
+                # 现在我们来介绍一下“torch.__future__.getoverwrite_module_params_onconversion（）`全局标志，
+                # 让用户控制是否希望覆盖现有张量的未来行为。
                 return not torch.__future__.get_overwrite_module_params_on_conversion()
             else:
                 return False
@@ -800,19 +880,23 @@ class Module:
         should_use_swap_tensors = torch.__future__.get_swap_module_params_on_conversion()
 
         for key, param in self._parameters.items():
+            """
+            遍历 self._parameters 中的所有参数。对于每个参数，它在 torch.no_grad() 环境中应用函数 fn，以避免跟踪自动求导历史。
+            错误处理逻辑，确保在交换张量或更新参数过程中出现的任何问题都能被捕获并报告。
+            """
             if param is None:
                 continue
-            # Tensors stored in modules are graph leaves, and we don't want to
-            # track autograd history of `param_applied`, so we have to use
-            # `with torch.no_grad():`
+            # 存储在module中的张量是图叶子，我们不想跟踪“param_applied”的自动求导历史记录，所以我们必须使用“with torch.nograd（）”：`
             with torch.no_grad():
                 param_applied = fn(param)
+
+            # 方法要么使用 .data = 对参数进行原地更新，要么创建一个新的 Parameter 并替换 self._parameters 中的旧参数。
             p_should_use_set_data = compute_should_use_set_data(param, param_applied)
 
-            # subclasses may have multiple child tensors so we need to use swap_tensors
+            # 子类可能有多个子张量，因此我们需要使用swap张量
             p_should_use_swap_tensors = should_use_swap_tensors or is_traceable_wrapper_subclass(param_applied)
 
-            param_grad = param.grad
+            param_grad = param.grad     # 如果参数有梯度（param.grad），方法同样对梯度应用函数 fn，并相应地更新它，可以是原地更新，也可以是创建新的梯度。
             if p_should_use_swap_tensors:
                 try:
                     if param_grad is not None:
@@ -854,15 +938,17 @@ class Module:
                     out_param.grad = grad_applied.requires_grad_(param_grad.requires_grad)
 
         for key, buf in self._buffers.items():
+            """
+            遍历 self._buffers 中的所有缓冲区，并对其每个缓冲区应用函数 fn。"""
             if buf is not None:
                 self._buffers[key] = fn(buf)
 
         return self
 
+    # 对自己或子模块应用函数
     def apply(self: T, fn: Callable[['Module'], None]) -> T:
-        r"""Apply ``fn`` recursively to every submodule (as returned by ``.children()``) as well as self.
-
-        Typical use includes initializing the parameters of a model
+        r"""递归地将`fn`应用于每个子模块（如`.children（）`返回的）以及self。
+        典型用途包括初始化模型的参数
         (see also :ref:`nn-init-doc`).
 
         Args:
@@ -895,18 +981,17 @@ class Module:
             )
 
         """
+        # 对自己或子模块应用函数
         for module in self.children():
             module.apply(fn)
         fn(self)
         return self
 
+    # 下面四个函数一个作用：
+    # 将Module所有的parameters and buffers移动到GPU、ipu、xpu、cpu
     def cuda(self: T, device: Optional[Union[int, device]] = None) -> T:
-        r"""Move all model parameters and buffers to the GPU.
-
-        This also makes associated parameters and buffers different objects. So
-        it should be called before constructing optimizer if the module will
-        live on GPU while being optimized.
-
+        r"""这也使得相关参数和缓冲区成为不同的对象. So it should be called before constructing optimizer if the module will live on GPU while being optimized.
+            因此，如果模块在优化时将驻留在GPU上，则应在构建优化器之前调用这个方法。
         .. note::
             This method modifies the module in-place.
 
@@ -917,6 +1002,10 @@ class Module:
         Returns:
             Module: self
         """
+
+        # 调用_apply方法，传入的函数lambda 函数lambda t: t.cuda(device)。
+        # 这个 lambda 函数对模块中的每个张量调用 .cuda(device) 方法，将其移动到 GPU。
+        # t是张量，调用的是张量的cuda而不是module的cuda方法
         return self._apply(lambda t: t.cuda(device))
 
     def ipu(self: T, device: Optional[Union[int, device]] = None) -> T:
@@ -968,6 +1057,7 @@ class Module:
         """
         return self._apply(lambda t: t.cpu())
 
+    # 将所有参数和缓冲区强制转换`dst_type`数据类型
     def type(self: T, dst_type: Union[dtype, str]) -> T:
         r"""Casts all parameters and buffers to :attr:`dst_type`.
 
@@ -1026,9 +1116,12 @@ class Module:
         """
         return self._apply(lambda t: t.bfloat16() if t.is_floating_point() else t)
 
+    # 将模块的所有参数和缓冲区移动到指定的设备上，但是不复制存储（即不实际移动数据）。创建新的、空的张量，这些张量的形状和类型与原始张量相同，
     def to_empty(self: T, *, device: Optional[DeviceLikeType], recurse: bool = True) -> T:
         r"""Move the parameters and buffers to the specified device without copying storage.
-
+        这个方法的一个可能用途是当你想改变张量的设备属性，但不想复制数据时。这在某些情况下可以节省内存和计算资源，特别是当你处理大型张量时。
+        后续操作：如果你在调用 to_empty 之后立即对这些参数或缓冲区进行操作（例如，进行数学运算），那么 PyTorch 将自动处理数据的实际移动。
+        也就是说，当你开始使用这些张量时，PyTorch 会确保它们在正确的设备上，并且如果需要，会将数据复制到那里。
         Args:
             device (:class:`torch.device`): The desired device of the parameters
                 and buffers in this module.
@@ -1040,19 +1133,24 @@ class Module:
         """
         return self._apply(lambda t: torch.empty_like(t, device=device), recurse=recurse)
 
+    # 使用了 Python 的 @overload 装饰器来定义多个重载版本。这些重载提供了不同的调用方式，以满足不同的使用场景。
+    # (1)允许用户指定设备和数据类型，以及一个可选的 non_blocking 参数，表示是否异步复制张量。如果 non_blocking 为 True，则复制操作不会阻塞当前线程。
     @overload
     def to(self, device: Optional[DeviceLikeType] = ..., dtype: Optional[dtype] = ...,
            non_blocking: bool = ...) -> Self:
         ...
 
+    # (2)这个重载只接受数据类型和 non_blocking 参数，用于只更改张量的数据类型而不改变其所在的设备。
     @overload
     def to(self, dtype: dtype, non_blocking: bool = ...) -> Self:
         ...
 
+    # (3)这个重载接受一个 Tensor 对象作为参数，用于将调用对象转换为与提供的 tensor 相同的数据类型和设备。
     @overload
     def to(self, tensor: Tensor, non_blocking: bool = ...) -> Self:
         ...
 
+    # (4)实际的 to 方法接受任意数量的位置参数和关键字参数；移动和/或强制转换参数和缓冲区
     def to(self, *args, **kwargs):
         r"""Move and/or cast the parameters and buffers.
 
@@ -1177,6 +1275,8 @@ class Module:
 
         return self._apply(convert)
 
+    # 下面9个方法是关于注册、获取Module钩子以及检查状态的函数
+    # (1)注册在完整反向传播开始之前的钩子
     def register_full_backward_pre_hook(
         self,
         hook: Callable[["Module", _grad_t], Union[None, _grad_t]],
@@ -1223,9 +1323,11 @@ class Module:
         handle = hooks.RemovableHandle(self._backward_pre_hooks)
         self._backward_pre_hooks[handle.id] = hook
         if prepend:
+            '表示是否将新注册的钩子函数添加到钩子列表的开头（即反向传播时将首先执行这个钩子）。'
             self._backward_pre_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
 
+    # (2)注册在反向传播时的钩子，不论是否是完整反向传播。
     def register_backward_hook(
         self, hook: Callable[['Module', _grad_t, _grad_t], Union[None, _grad_t]]
     ) -> RemovableHandle:
@@ -1250,6 +1352,7 @@ class Module:
         self._backward_hooks[handle.id] = hook
         return handle
 
+    # (3)在完整反向传播结束之后执行的钩子函数。
     def register_full_backward_hook(
         self,
         hook: Callable[["Module", _grad_t, _grad_t], Union[None, _grad_t]],
@@ -1310,6 +1413,7 @@ class Module:
             self._backward_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
 
+    # 获取已有反向传播钩子
     def _get_backward_hooks(self):
         r"""Return the backward hooks for use in the call function.
 
@@ -1400,6 +1504,7 @@ class Module:
                     stacklevel=2,
                 )
 
+    # (4)在前向传播之前的钩子
     def register_forward_pre_hook(
         self,
         hook: Union[
@@ -1464,6 +1569,7 @@ class Module:
             self._forward_pre_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
 
+    # (5)在前向传播时的钩子
     def register_forward_hook(
         self,
         hook: Union[
@@ -1530,7 +1636,13 @@ class Module:
             self._forward_hooks.move_to_end(handle.id, last=False)  # type: ignore[attr-defined]
         return handle
 
+    #　前向传播时，如果模块的 forward 函数已经被 JIT 编译，就使用编译过的版本；如果没有被编译，则直接执行 Python 层面的 forward 函数。
     def _slow_forward(self, *input, **kwargs):
+        """
+        这个方法的实现确保了在TorchScript追踪过程中，模块的前向传播能够正确地记录作用域信息，
+        同时也支持在没有追踪的情况下直接执行前向传播。这是PyTorch中TorchScript功能的一部分，
+        允许开发者将Python代码转换为TorchScript，以提高性能和可移植性。
+        """
         tracing_state = torch._C._get_tracing_state()
         if not tracing_state or isinstance(self.forward, torch._C.ScriptMethod):
             return self.forward(*input, **kwargs)
@@ -1550,21 +1662,26 @@ class Module:
                 tracing_state.pop_scope()
         return result
 
+    # 作为模块调用的包装器（wrapper），用于决定是执行 JIT 编译过的前向传播实现，还是执行普通的 Python 前向传播实现。调用下者
     def _wrapped_call_impl(self, *args, **kwargs):
         if self._compiled_call_impl is not None:
             return self._compiled_call_impl(*args, **kwargs)  # type: ignore[misc]
         else:
             return self._call_impl(*args, **kwargs)
-
+    
+    # 是模块调用的实际实现，它处理了模块的前向传播，包括执行前向钩子（forward hooks）、前向传播本身，以及设置反向钩子（backward hooks）
     def _call_impl(self, *args, **kwargs):
+
+        # 根据是否处于TorchScript追踪状态，选择使用 _slow_forward 方法还是直接使用 self.forward。
         forward_call = (self._slow_forward if torch._C._get_tracing_state() else self.forward)
-        # If we don't have any hooks, we want to skip the rest of the logic in
-        # this function, and just call forward.
+
+        # 如果没有注册任何钩子（四种钩子），直接调用前向调用并返回结果。
         if not (self._backward_hooks or self._backward_pre_hooks or self._forward_hooks or self._forward_pre_hooks
                 or _global_backward_pre_hooks or _global_backward_hooks
                 or _global_forward_hooks or _global_forward_pre_hooks):
             return forward_call(*args, **kwargs)
 
+        # 如果有钩子注册，进入try模块
         try:
             result = None
             called_always_called_hooks = set()
@@ -1574,9 +1691,11 @@ class Module:
             if self._backward_pre_hooks or _global_backward_pre_hooks:
                 backward_pre_hooks = self._get_backward_pre_hooks()
 
+            # 获取将被调用的反向钩子，分为全反向钩子和非全反向钩子。
             if self._backward_hooks or _global_backward_hooks:
                 full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
 
+            # 如果注册了前向预钩子，遍历并执行它们，可能修改 args 和 kwargs。
             if _global_forward_pre_hooks or self._forward_pre_hooks:
                 for hook_id, hook in (
                     *_global_forward_pre_hooks.items(),
@@ -1599,12 +1718,16 @@ class Module:
                                 args_result = (args_result,)
                             args = args_result
 
+            # 如果存在反向预钩子或全反向钩子，创建一个 BackwardHook 对象，并设置输入钩子。
             bw_hook = None
             if full_backward_hooks or backward_pre_hooks:
                 bw_hook = hooks.BackwardHook(self, full_backward_hooks, backward_pre_hooks)
                 args = bw_hook.setup_input_hook(args)
 
+            # 调用前向调用并获取结果。
             result = forward_call(*args, **kwargs)
+
+            # 如果注册了前向钩子，遍历并执行它们，可能修改结果。
             if _global_forward_hooks or self._forward_hooks:
                 for hook_id, hook in (
                     *_global_forward_hooks.items(),
@@ -1622,6 +1745,7 @@ class Module:
                     if hook_result is not None:
                         result = hook_result
 
+            # 如果存在反向钩子，将结果传递给反向钩子的输出设置。
             if bw_hook:
                 if not isinstance(result, (torch.Tensor, tuple)):
                     warnings.warn("For backward hooks to be called,"
@@ -1629,7 +1753,7 @@ class Module:
                                   f" but received {type(result)}")
                 result = bw_hook.setup_output_hook(result)
 
-            # Handle the non-full backward hooks
+            # 对于非全反向钩子，找到结果中的 Tensor 或 Tensor 元组，并为它们的 grad_fn 注册钩子。Handle the non-full backward hooks
             if non_full_backward_hooks:
                 var = result
                 while not isinstance(var, torch.Tensor):
@@ -1646,9 +1770,7 @@ class Module:
             return result
 
         except Exception:
-            # run always called hooks if they have not already been run
-            # For now only forward hooks have the always_call option but perhaps
-            # this functionality should be added to full backward hooks as well.
+            # run如果尚未运行，则始终调用钩子。目前只有前向钩子具有always_call选项，但也许这个功能也应该添加到完整的后向钩子中。
             for hook_id, hook in _global_forward_hooks.items():
                 if hook_id in _global_forward_hooks_always_called and hook_id not in called_always_called_hooks:  # type: ignore[possibly-undefined]
                     try:
@@ -1675,14 +1797,18 @@ class Module:
                         continue
             # raise exception raised in try block
             raise
-
+    
+    # __call__方法是一个特殊方法，用于让一个类实例表现得像函数一样，可以被调用。当定义了一个__call__方法后，类的实例可以通过()语法执行。
     __call__ : Callable[..., Any] = _wrapped_call_impl
 
+
+    # 下面两个是PyTorch Module 类中用于序列化和反序列化的两个特殊方法
+    # 定义了当对象需要被序列化时的行为：复制对象的字典属性，这个字典包含了类实例的所有属性和值。
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_compiled_call_impl", None)
         return state
-
+    # 定义了当对象从序列化状态恢复（反序列化）时的行为。
     def __setstate__(self, state):
         self.__dict__.update(state)
 
@@ -1710,13 +1836,13 @@ class Module:
         if '_backward_pre_hooks' not in self.__dict__:
             self._backward_pre_hooks = OrderedDict()
 
-    # On the return type:
-    # We choose to return `Any` in the `__getattr__` type signature instead of a more strict `Union[Tensor, Module]`.
-    # This is done for better interop with various type checkers for the end users.
-    # Having a stricter return type doesn't play nicely with `register_buffer()` and forces
-    # people to excessively use type-ignores, asserts, casts, etc.
-    # See full discussion on the problems with returning `Union` here
-    # https://github.com/microsoft/pyright/issues/4213
+
+    # 下面三个是关于属性获取、设置、删除的函数
+
+    # 关于返回类型：我们选择在`__getatr__`类型签名中返回`Any`，而不是更严格的`Union[Tensor，Module]。这
+    # 样做是为了更好地与最终用户的各种类型检查器进行互操作。
+    # 使用更严格的返回类型并不能很好地与`register_buffer（）`配合使用，并迫使人们过度使用类型忽略、断言、强制转换等。
+    # 请参阅此处关于返回`Union `问题的完整讨论https://github.com/microsoft/pyright/issues/4213On the return type:
     def __getattr__(self, name: str) -> Any:
         if '_parameters' in self.__dict__:
             _parameters = self.__dict__['_parameters']
@@ -1802,6 +1928,7 @@ class Module:
         else:
             super().__delattr__(name)
 
+    # 注册state_dict（之前）的两个钩子函数，以及保存为state_dict的方法
     def _register_state_dict_hook(self, hook):
         r"""Register a state-dict hook.
 
@@ -1856,6 +1983,7 @@ class Module:
     # back that same object. But if they pass nothing, an `OrderedDict` is created and returned.
     T_destination = TypeVar('T_destination', bound=Dict[str, Any])
 
+    # state_dict的两个重载和一个本体
     @overload
     def state_dict(self, *, destination: T_destination, prefix: str = ..., keep_vars: bool = ...) -> T_destination:
         ...
@@ -1947,6 +2075,7 @@ class Module:
                 destination = hook_result
         return destination
 
+    # 注册加载state_dict（pre）的两个hook
     def _register_load_state_dict_pre_hook(self, hook, with_module=False):
         r"""Register a pre-hook for the :meth:`~torch.nn.Module.load_state_dict` method.
 
@@ -1997,6 +2126,7 @@ class Module:
         self._load_state_dict_post_hooks[handle.id] = hook
         return handle
 
+    # 从state_dict加载
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):
         r"""Copy parameters and buffers from :attr:`state_dict` into only this module, but not its descendants.
@@ -2128,6 +2258,7 @@ class Module:
                     elif input_name[0] not in local_state:
                         unexpected_keys.append(key)
 
+    # 加载state_dict
     def load_state_dict(self, state_dict: Mapping[str, Any],
                         strict: bool = True, assign: bool = False):
         r"""Copy parameters and buffers from :attr:`state_dict` into this module and its descendants.
@@ -2234,6 +2365,7 @@ class Module:
                 name = module_prefix + ('.' if module_prefix else '') + k
                 yield name, v
 
+    # 返回模块的parameters迭代器
     def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
         r"""Return an iterator over module parameters.
 
@@ -2340,6 +2472,7 @@ class Module:
             prefix=prefix, recurse=recurse, remove_duplicate=remove_duplicate)
         yield from gen
 
+    # named_children的一个子方法，只返回结构
     def children(self) -> Iterator['Module']:
         r"""Return an iterator over immediate children modules.
 
@@ -2349,6 +2482,7 @@ class Module:
         for name, module in self.named_children():
             yield module
 
+    # 返回子模块及其名称
     def named_children(self) -> Iterator[Tuple[str, 'Module']]:
         r"""Return an iterator over immediate children modules, yielding both the name of the module as well as the module itself.
 
@@ -2438,14 +2572,10 @@ class Module:
                 submodule_prefix = prefix + ('.' if prefix else '') + name
                 yield from module.named_modules(memo, submodule_prefix, remove_duplicate)
 
+    # 递归子模块设置为设置为train状态，调用的是tensor的train方法
     def train(self: T, mode: bool = True) -> T:
-        r"""Set the module in training mode.
-
-        This has any effect only on certain modules. See documentations of
-        particular modules for details of their behaviors in training/evaluation
-        mode, if they are affected, e.g. :class:`Dropout`, :class:`BatchNorm`,
-        etc.
-
+        r"""这只对某些模块有影响。如果它们受到影响，请参阅特定模块的文档，了解它们在培训/评估模式下的行为细节，
+        例如：class:“Dropout”、：class:`BatchNorm`等。
         Args:
             mode (bool): whether to set training mode (``True``) or evaluation
                          mode (``False``). Default: ``True``.
@@ -2460,6 +2590,7 @@ class Module:
             module.train(mode)
         return self
 
+    # 同上
     def eval(self: T) -> T:
         r"""Set the module in evaluation mode.
 
@@ -2478,6 +2609,7 @@ class Module:
         """
         return self.train(False)
 
+    # 同上遍历
     def requires_grad_(self: T, requires_grad: bool = True) -> T:
         r"""Change if autograd should record operations on parameters in this module.
 
@@ -2528,6 +2660,8 @@ class Module:
                         p.grad.requires_grad_(False)
                     p.grad.zero_()
 
+    # share_memory_ 方法用于将张量移动到共享内存中，这允许多个进程可以访问该张量而无需复制数据。
+    # 这个方法是 Tensor 类的一个实例方法，并且可以在 Module 类中通过 _apply 方法间接使用。
     def share_memory(self: T) -> T:
         r"""See :meth:`torch.Tensor.share_memory_`."""
         return self._apply(lambda t: t.share_memory_())
@@ -2569,32 +2703,37 @@ class Module:
         main_str += ')'
         return main_str
 
+    # 用于返回对象的属性列表。在 PyTorch 的 Module 类中，这个方法被重写，以提供更具体的行为，
+    # 尤其是在列出模块的属性时。以下是对 Module 类中 __dir__ 方法的解释：
     def __dir__(self):
         module_attrs = dir(self.__class__)
-        attrs = list(self.__dict__.keys())
-        parameters = list(self._parameters.keys())
-        modules = list(self._modules.keys())
+        attrs = list(self.__dict__.keys())          
+        parameters = list(self._parameters.keys())  
+        modules = list(self._modules.keys())        
         buffers = list(self._buffers.keys())
         keys = module_attrs + attrs + parameters + modules + buffers
 
-        # Eliminate attrs that are not legal Python variable names
+        # 删除不合法的Python变量名的attr
         keys = [key for key in keys if not key[0].isdigit()]
 
         return sorted(keys)
 
+    # 用于创建模块的一个副本，这个副本通常用于数据并行操作。
+    # 这个方法的目的是为数据并行操作创建一个模块的副本，其中副本不会复制原始模块的参数和缓冲区数据，而是引用原始模块的数据。这在多GPU训练时非常有用，可以减少内存使用并提高效率。
     def _replicate_for_data_parallel(self):
         replica = self.__new__(type(self))
-        replica.__dict__ = self.__dict__.copy()
+        replica.__dict__ = self.__dict__.copy()      # 复制了原始模块实例的 __dict__ 属性到副本中。__dict__ 包含了模块的所有属性和值。
 
-        # replicas do not have parameters themselves, the replicas reference the original
-        # module.
-        replica._parameters = OrderedDict()
-        replica._buffers = replica._buffers.copy()
+        # 副本本身没有参数，副本引用原始模块。
+        replica._parameters = OrderedDict()          # 初始化了一个空的有序字典，用于存储副本的参数。
+        replica._buffers = replica._buffers.copy()   # 复制了原始模块的缓冲区到副本，注意这里可能是一个错误，因为 replica 还没有 _buffers 属性，正确的可能是 replica._buffers = self._buffers.copy()。
         replica._modules = replica._modules.copy()
         replica._is_replica = True  # type: ignore[assignment]
 
         return replica
 
+    # 编译当前模块（Module）的前向传播（forward）过程，并设置Module的_compiled_call_impl属性
+    # 这个方法通过调用 torch.compile 函数来实现编译，torch.compile 是 PyTorch 中的一个函数，用于优化和编译模型的计算图，以加速模型的前向和/或反向传播过程。
     def compile(self, *args, **kwargs):
         """
         Compile this Module's forward using :func:`torch.compile`.

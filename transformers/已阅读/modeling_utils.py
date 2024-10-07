@@ -2814,7 +2814,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             )
         else:
             return super().cuda(*args, **kwargs)
-
+    # 检查不被允许用to方法的量化等方法后，调研父类nn.Module的to方法
     @wraps(torch.nn.Module.to)
     def to(self, *args, **kwargs):
         if getattr(self, "quantization_method", None) == QuantizationMethod.HQQ:
